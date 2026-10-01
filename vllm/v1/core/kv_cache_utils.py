@@ -497,6 +497,110 @@ class FreeKVCacheBlockQueue:
             curr_block = curr_block.next_free_block
 
 
+class TieredFreeKVCacheBlockQueue:
+    """Two free lists with allocation-time balancing and stable block tiers."""
+
+    def __init__(
+        self,
+        blocks: list[KVCacheBlock],
+        hbm_blocks: int,
+        target_hbm_fraction: float,
+        stripe_blocks: int = 32,
+    ) -> None:
+        assert 0 < hbm_blocks <= len(blocks)
+        assert 0 < target_hbm_fraction < 1
+        assert stripe_blocks > 0
+        self.hbm_blocks = hbm_blocks
+        self.target_hbm_fraction = target_hbm_fraction
+        self.stripe_blocks = stripe_blocks
+        self.queues = (
+            FreeKVCacheBlockQueue(blocks[:hbm_blocks]),
+            FreeKVCacheBlockQueue(blocks[hbm_blocks:]),
+        )
+        self.active_blocks = [0, 0]
+        self.stripe_tier = 0
+        self.stripe_remaining = 0
+
+    @property
+    def num_free_blocks(self) -> int:
+        return sum(queue.num_free_blocks for queue in self.queues)
+
+    def _tier(self, block: KVCacheBlock) -> int:
+        return int(block.block_id >= self.hbm_blocks)
+
+    def _next_tier(self) -> int:
+        hbm_free = self.queues[0].num_free_blocks
+        ddr_free = self.queues[1].num_free_blocks
+        if not hbm_free:
+            return 1
+        if not ddr_free:
+            return 0
+        hbm_load = self.active_blocks[0] / self.target_hbm_fraction
+        ddr_load = self.active_blocks[1] / (1 - self.target_hbm_fraction)
+        return 0 if hbm_load <= ddr_load else 1
+
+    def popleft(self) -> KVCacheBlock:
+        return self.popleft_n(1)[0]
+
+    def popleft_n(self, n: int) -> list[KVCacheBlock]:
+        if n > self.num_free_blocks:
+            raise ValueError(f"Cannot get {n} free blocks from the pool")
+        result: list[KVCacheBlock] = []
+        while n:
+            if (
+                not self.stripe_remaining
+                or not self.queues[self.stripe_tier].num_free_blocks
+            ):
+                self.stripe_tier = self._next_tier()
+                self.stripe_remaining = self.stripe_blocks
+            tier = self.stripe_tier
+            count = min(n, self.stripe_remaining, self.queues[tier].num_free_blocks)
+            result.extend(self.queues[tier].popleft_n(count))
+            self.active_blocks[tier] += count
+            self.stripe_remaining -= count
+            n -= count
+        return result
+
+    def remove(self, block: KVCacheBlock) -> None:
+        tier = self._tier(block)
+        self.queues[tier].remove(block)
+        self.active_blocks[tier] += 1
+
+    def append(self, block: KVCacheBlock) -> None:
+        tier = self._tier(block)
+        self.queues[tier].append(block)
+        self.active_blocks[tier] -= 1
+
+    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
+        self._return_blocks(blocks, prepend=True)
+
+    def append_n(self, blocks: list[KVCacheBlock]) -> None:
+        self._return_blocks(blocks, prepend=False)
+
+    def _return_blocks(self, blocks: list[KVCacheBlock], prepend: bool) -> None:
+        by_tier: tuple[list[KVCacheBlock], list[KVCacheBlock]] = ([], [])
+        for block in blocks:
+            by_tier[self._tier(block)].append(block)
+        for tier, returned in enumerate(by_tier):
+            if prepend:
+                self.queues[tier].prepend_n(returned)
+            else:
+                self.queues[tier].append_n(returned)
+            self.active_blocks[tier] -= len(returned)
+
+    def get_all_free_blocks(self) -> list[KVCacheBlock]:
+        return [block for queue in self.queues for block in queue.get_all_free_blocks()]
+
+    def iter_blocks_after(self, cursor: KVCacheBlock | None) -> Iterator[KVCacheBlock]:
+        blocks = self.get_all_free_blocks()
+        if cursor is not None:
+            for index, block in enumerate(blocks):
+                if block is cursor:
+                    blocks = blocks[index + 1 :]
+                    break
+        yield from blocks
+
+
 def _gen_mm_extra_hash_keys(
     request: Request, start_token_idx: int, end_token_idx: int, start_mm_idx: int
 ) -> tuple[list[Any], int]:

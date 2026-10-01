@@ -40,6 +40,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     check_enough_kv_cache_memory,
     estimate_max_model_len,
     generate_block_hash_extra_keys,
@@ -578,6 +579,23 @@ def test_free_kv_cache_block_queue_initialization():
     assert queue.num_free_blocks == 1
     assert queue.fake_free_list_head.next_free_block is block
     assert queue.fake_free_list_tail.prev_free_block is block
+
+
+def test_tiered_free_block_queue_balances_allocations_and_reuses_blocks():
+    blocks = [KVCacheBlock(block_id=i) for i in range(16)]
+    queue = TieredFreeKVCacheBlockQueue(
+        blocks, hbm_blocks=8, target_hbm_fraction=0.5, stripe_blocks=2
+    )
+
+    allocated = queue.popleft_n(8)
+    assert sum(block.block_id < 8 for block in allocated) == 4
+    assert sum(block.block_id >= 8 for block in allocated) == 4
+    assert queue.active_blocks == [4, 4]
+
+    queue.append_n(allocated)
+    assert queue.active_blocks == [0, 0]
+    assert queue.num_free_blocks == 16
+    assert {block.block_id for block in queue.get_all_free_blocks()} == set(range(16))
 
 
 def test_free_kv_cache_block_queue_operations():
