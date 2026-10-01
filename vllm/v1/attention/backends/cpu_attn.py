@@ -19,6 +19,7 @@ from vllm.config import (
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -157,6 +158,13 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         self.dtype = vllm_config.model_config.dtype
         self.window_size = self._group_sliding_window()
         self.block_size = kv_cache_spec.block_size
+        self.hbm_blocks = 0
+        if envs.VLLM_CPU_HBM_KV_CACHE_GIB:
+            self.hbm_blocks = (
+                envs.VLLM_CPU_HBM_KV_CACHE_GIB
+                * GiB_bytes
+                // (len(layer_names) * kv_cache_spec.page_size_bytes)
+            )
         self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
         self.isa = _get_attn_isa(
             self.dtype,
@@ -268,6 +276,10 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             enable_kv_split=envs.VLLM_CPU_ATTN_SPLIT_KV,
             dynamic_causal=dynamic_casual,
             kv_cache_dtype=self.kv_cache_dtype,
+            block_table=block_table_tensor if self.hbm_blocks else None,
+            block_size=self.block_size,
+            hbm_blocks=self.hbm_blocks,
+            hbm_threads=envs.VLLM_CPU_TIERED_ATTN_HBM_THREADS,
         )
 
         attn_metadata = CPUAttentionMetadata(
