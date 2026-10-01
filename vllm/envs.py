@@ -54,6 +54,11 @@ if TYPE_CHECKING:
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
     VLLM_CPU_CI_ENV: bool = False
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
+    VLLM_CPU_HBM_KV_CACHE_GIB: int = 0
+    VLLM_CPU_HBM_NODE: int = -1
+    VLLM_CPU_DDR_NODE: int = -1
+    VLLM_CPU_TIERED_KV_HBM_FRACTION: float = 0.67
+    VLLM_CPU_TIERED_ATTN_HBM_THREADS: int = 0
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
     VLLM_CPU_INT4_W4A8: bool = True
     VLLM_XLA_CACHE_PATH: str = os.path.join(VLLM_CACHE_ROOT, "xla_cache")
@@ -899,6 +904,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (CPU backend only) whether to enable attention spilt KV.
     "VLLM_CPU_ATTN_SPLIT_KV": lambda: bool(
         int(os.getenv("VLLM_CPU_ATTN_SPLIT_KV", "1"))
+    ),
+    "VLLM_CPU_HBM_KV_CACHE_GIB": lambda: int(
+        os.getenv("VLLM_CPU_HBM_KV_CACHE_GIB", "0")
+    ),
+    "VLLM_CPU_HBM_NODE": lambda: int(os.getenv("VLLM_CPU_HBM_NODE", "-1")),
+    "VLLM_CPU_DDR_NODE": lambda: int(os.getenv("VLLM_CPU_DDR_NODE", "-1")),
+    "VLLM_CPU_TIERED_KV_HBM_FRACTION": lambda: float(
+        os.getenv("VLLM_CPU_TIERED_KV_HBM_FRACTION", "0.67")
+    ),
+    "VLLM_CPU_TIERED_ATTN_HBM_THREADS": lambda: int(
+        os.getenv("VLLM_CPU_TIERED_ATTN_HBM_THREADS", "0")
     ),
     # (Zen CPU backend) eagerly prepack weights into ZenDNN blocked layout
     # at model load time. Eliminates per-inference layout conversion overhead.
