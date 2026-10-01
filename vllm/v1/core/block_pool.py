@@ -19,6 +19,7 @@ from vllm.v1.core.kv_cache_utils import (
     ExternalBlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    TieredFreeKVCacheBlockQueue,
     generate_block_hash_extra_keys,
     get_block_hash,
     get_group_id,
@@ -161,6 +162,8 @@ class BlockPool:
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
         medium: str = MEDIUM_GPU,
+        hbm_blocks: int | None = None,
+        target_hbm_fraction: float = 0.67,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -174,7 +177,13 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue = (
+            FreeKVCacheBlockQueue(self.blocks)
+            if hbm_blocks is None
+            else TieredFreeKVCacheBlockQueue(
+                self.blocks, hbm_blocks, target_hbm_fraction
+            )
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
