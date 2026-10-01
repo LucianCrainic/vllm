@@ -1,8 +1,10 @@
 #ifndef CPU_ATTN_HPP
 #define CPU_ATTN_HPP
 
+#include <algorithm>
 #include <type_traits>
 #include <cstddef>
+#include <cmath>
 
 #if defined(__APPLE__)
   #include <sys/sysctl.h>
@@ -435,6 +437,11 @@ class AttentionScheduler {
       has_decode_request = has_decode_request || (q_token_num == 1);
       decode_only_batch = decode_only_batch && (q_token_num == 1);
     }
+    if (input.hbm_blocks > 0 && input.block_table != nullptr &&
+        input.enable_kv_split && decode_only_batch && input.causal &&
+        input.dynamic_causal == nullptr && input.sliding_window_size == -1) {
+      return schedule_tiered_decode(input);
+    }
     const int32_t original_q_head_per_kv =
         input.num_heads_q / input.num_heads_kv;
     int32_t q_head_per_kv = original_q_head_per_kv;
@@ -769,6 +776,183 @@ class AttentionScheduler {
     //     }
     // }
 
+    return metadata_tensor;
+  }
+
+  torch::Tensor schedule_tiered_decode(const ScheduleInput& input) const {
+    const int32_t thread_num = cpu_utils::get_max_threads();
+    if (thread_num < 2) {
+      ScheduleInput fallback = input;
+      fallback.hbm_blocks = 0;
+      return schedule(fallback);
+    }
+    TORCH_CHECK(input.block_size > 0);
+    TORCH_CHECK(input.block_size % input.kv_block_alignment == 0);
+
+    struct TierRun {
+      int32_t tier;
+      int32_t start;
+      int32_t end;
+    };
+    std::vector<std::vector<TierRun>> runs(input.num_reqs);
+    int64_t tier_tokens[2] = {0, 0};
+    for (int32_t req = 0; req < input.num_reqs; ++req) {
+      const int32_t seq_len = input.seq_lens[req];
+      const int32_t num_blocks =
+          (seq_len + input.block_size - 1) / input.block_size;
+      TORCH_CHECK_LE(num_blocks, input.block_table_width);
+      const int32_t* table = input.block_table + req * input.block_table_stride;
+      int32_t run_start = 0;
+      int32_t run_tier = -1;
+      for (int32_t block = 0; block <= num_blocks; ++block) {
+        int32_t tier = -1;
+        if (block < num_blocks) {
+          TORCH_CHECK_GE(table[block], 0);
+          tier = table[block] < input.hbm_blocks ? 0 : 1;
+        }
+        if (tier == run_tier) continue;
+        if (run_tier >= 0) {
+          const int32_t start = run_start * input.block_size;
+          const int32_t end = std::min(block * input.block_size, seq_len);
+          runs[req].push_back({run_tier, start, end});
+          tier_tokens[run_tier] += end - start;
+        }
+        run_start = block;
+        run_tier = tier;
+      }
+    }
+    if (!tier_tokens[0] || !tier_tokens[1]) {
+      ScheduleInput fallback = input;
+      fallback.hbm_blocks = 0;
+      return schedule(fallback);
+    }
+
+    const int32_t hbm_threads =
+        input.hbm_threads > 0
+            ? input.hbm_threads
+            : std::clamp(static_cast<int32_t>(std::round(
+                             thread_num * tier_tokens[0] /
+                             (tier_tokens[0] + 1.3 * tier_tokens[1]))),
+                         1, thread_num - 1);
+    TORCH_CHECK_GT(hbm_threads, 0);
+    TORCH_CHECK_LT(hbm_threads, thread_num);
+    const int32_t tier_threads[2] = {hbm_threads, thread_num - hbm_threads};
+    const int32_t slot_start[2] = {0, hbm_threads};
+    const int32_t target_tokens[2] = {
+        static_cast<int32_t>(
+            ((tier_tokens[0] + tier_threads[0] * input.block_size - 1) /
+             (tier_threads[0] * input.block_size)) *
+            input.block_size),
+        static_cast<int32_t>(
+            ((tier_tokens[1] + tier_threads[1] * input.block_size - 1) /
+             (tier_threads[1] * input.block_size)) *
+            input.block_size)};
+
+    std::vector<std::vector<AttentionWorkItemGroup>> slot_items(thread_num);
+    std::vector<int64_t> slot_load(thread_num, 0);
+    std::vector<ReductionWorkItemGroup> reduce_workitems;
+    int32_t split_count = 0;
+    for (int32_t req = 0; req < input.num_reqs; ++req) {
+      struct TieredItem {
+        int32_t tier;
+        AttentionWorkItemGroup work;
+      };
+      std::vector<TieredItem> request_items;
+      for (const TierRun& run : runs[req]) {
+        for (int32_t start = run.start; start < run.end;
+             start += target_tokens[run.tier]) {
+          const int32_t end =
+              std::min(start + target_tokens[run.tier], run.end);
+          AttentionWorkItemGroup work(req, 0, start, end);
+          work.q_token_num = 1;
+          work.total_kv_len = end - start;
+          request_items.push_back({run.tier, work});
+        }
+      }
+      if (request_items.size() > 1) {
+        reduce_workitems.emplace_back(
+            ReductionWorkItemGroup(req, 0, 1, split_count));
+        reduce_workitems.back().split_num = request_items.size();
+        for (int32_t i = 0; i < static_cast<int32_t>(request_items.size());
+             ++i) {
+          request_items[i].work.split_id = split_count++;
+          request_items[i].work.local_split_id = i;
+        }
+      }
+      for (TieredItem& item : request_items) {
+        const int32_t first_slot = slot_start[item.tier];
+        const int32_t last_slot = first_slot + tier_threads[item.tier];
+        int32_t best_slot = first_slot;
+        for (int32_t slot = first_slot + 1; slot < last_slot; ++slot) {
+          if (slot_load[slot] < slot_load[best_slot]) best_slot = slot;
+        }
+        slot_load[best_slot] += item.work.total_kv_len;
+        slot_items[best_slot].push_back(item.work);
+      }
+    }
+
+    std::vector<AttentionWorkItemGroup> workitems;
+    std::vector<int32_t> workitem_num_per_thread(thread_num);
+    for (int32_t slot = 0; slot < thread_num; ++slot) {
+      workitem_num_per_thread[slot] = slot_items[slot].size();
+      workitems.insert(workitems.end(), slot_items[slot].begin(),
+                       slot_items[slot].end());
+    }
+    const int64_t metadata_size =
+        sizeof(AttentionMetadata) +
+        workitems.size() * sizeof(AttentionWorkItemGroup) +
+        reduce_workitems.size() * sizeof(ReductionWorkItemGroup);
+    auto options =
+        torch::TensorOptions().dtype(torch::kInt8).device(torch::kCPU);
+    torch::Tensor metadata_tensor = torch::empty({metadata_size}, options);
+    auto* metadata = new (metadata_tensor.data_ptr()) AttentionMetadata(
+        input.isa, workitems.size(), reduce_workitems.size(), split_count, 1);
+    metadata->tiered_hbm_threads = hbm_threads;
+    metadata->effective_thread_num = thread_num;
+    std::memcpy(metadata->workitem_groups_ptr, workitems.data(),
+                workitems.size() * sizeof(AttentionWorkItemGroup));
+    std::memcpy(metadata->reduction_items_ptr, reduce_workitems.data(),
+                reduce_workitems.size() * sizeof(ReductionWorkItemGroup));
+    std::memcpy(metadata->cu_workitem_num_per_thread + 1,
+                workitem_num_per_thread.data(),
+                workitem_num_per_thread.size() * sizeof(int32_t));
+    for (int32_t slot = 1; slot <= thread_num; ++slot) {
+      metadata->cu_workitem_num_per_thread[slot] +=
+          metadata->cu_workitem_num_per_thread[slot - 1];
+    }
+
+    const int32_t q_heads_per_kv = input.num_heads_q / input.num_heads_kv;
+    const bool use_gqa = q_heads_per_kv <= input.max_num_q_per_iter;
+    const int32_t q_head_tile_size = use_gqa ? q_heads_per_kv : 1;
+    const int32_t rounded_q_head_tile_size =
+        ((q_head_tile_size + input.max_num_q_per_iter - 1) /
+         input.max_num_q_per_iter) *
+        input.max_num_q_per_iter;
+    AttentionScratchPad scratch(0, *metadata, 0x0);
+    const int64_t kv_tile_size = calcu_tile_size_with_constant_q(
+        available_cache_size_, input.head_dim, input.elem_size,
+        input.q_buffer_elem_size, input.logits_buffer_elem_size,
+        input.output_buffer_elem_size, input.max_num_q_per_iter,
+        input.kv_block_alignment, rounded_q_head_tile_size,
+        rounded_q_head_tile_size <= input.max_num_q_per_iter);
+    scratch.update(input.head_dim, input.q_buffer_elem_size,
+                   input.logits_buffer_elem_size, input.output_buffer_elem_size,
+                   input.max_num_q_per_iter, rounded_q_head_tile_size,
+                   kv_tile_size);
+    metadata->attention_scratchpad_size_per_thread =
+        ((scratch.get_thread_scratchpad_size() + 63) / 64) * 64;
+    if (split_count) {
+      scratch.update(0, split_count, input.head_dim, q_head_tile_size,
+                     input.output_buffer_elem_size);
+      metadata->reduction_scratchpad_size_per_kv_head =
+          ((scratch.get_reduction_scratchpad_size() + 63) / 64) * 64;
+    }
+    const int64_t scratchpad_size =
+        metadata->attention_scratchpad_size_per_thread * thread_num +
+        metadata->reduction_scratchpad_size_per_kv_head *
+            (use_gqa ? input.num_heads_kv : input.num_heads_q);
+    cpu_utils::ScratchPadManager::get_scratchpad_manager()->realloc(
+        scratchpad_size);
     return metadata_tensor;
   }
 

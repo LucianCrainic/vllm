@@ -88,6 +88,62 @@ def get_attn_isa(
     )
 
 
+def test_tiered_decode_matches_standard_attention_for_interleaved_blocks():
+    block_size = 128
+    head_size = 128
+    num_heads = 8
+    num_kv_heads = 2
+    dtype = torch.bfloat16
+    isa = get_attn_isa(block_size, dtype)
+    torch.manual_seed(42)
+    query = torch.randn(2, num_heads, head_size, dtype=dtype)
+    kv_cache = torch.randn(4, num_kv_heads, 2 * block_size, head_size, dtype=dtype)
+    key_cache, value_cache = kv_cache.chunk(2, dim=2)
+    block_table = torch.tensor([[0, 2, 1], [3, 0, 2]], dtype=torch.int32)
+    seq_lens = torch.tensor([300, 256], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
+
+    def run(hbm_blocks: int) -> torch.Tensor:
+        metadata = cpu_attn_get_scheduler_metadata(
+            num_reqs=2,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_size,
+            seq_lens=seq_lens,
+            dtype=dtype,
+            query_start_loc=query_start_loc,
+            causal=True,
+            sliding_window_size=-1,
+            isa=isa,
+            enable_kv_split=True,
+            block_table=block_table if hbm_blocks else None,
+            block_size=block_size,
+            hbm_blocks=hbm_blocks,
+        )
+        output = torch.empty_like(query)
+        cpu_attention_with_kv_cache(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            output=output,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            scale=head_size**-0.5,
+            causal=True,
+            alibi_slopes=None,
+            sliding_window=-1,
+            block_table=block_table,
+            softcap=0,
+            scheduler_metadata=metadata,
+            s_aux=None,
+        )
+        return output
+
+    torch.testing.assert_close(
+        run(hbm_blocks=2), run(hbm_blocks=0), atol=0.03, rtol=0.03
+    )
+
+
 # rand number generation takes too much time, cache rand tensors
 @functools.lru_cache(maxsize=128, typed=False)
 def tensor_cache(elem_num: int, dtype: torch.dtype, tag: str = "none") -> torch.Tensor:
