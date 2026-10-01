@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     MultipleOf,
 )
+from vllm.v1.core.cpu_tiered_kv import get_cpu_tiered_kv_config
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -424,7 +425,22 @@ def allocate_kv_cache(
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    tiered = get_cpu_tiered_kv_config(kv_cache_config) if device.type == "cpu" else None
+    if tiered is None:
+        buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    else:
+        if layout != KVCacheLayout.LBHNC:
+            raise ValueError("Tiered CPU KV requires the LBHNC layout")
+        tensor = kv_cache_config.kv_cache_tensors[0]
+        buf = torch.ops._C.allocate_tiered_cpu_kv_cache(
+            raw_size,
+            len(tensor.layers),
+            kv_cache_config.num_blocks,
+            tiered.hbm_blocks,
+            tensor.block_stride,
+            tiered.hbm_node,
+            tiered.ddr_node,
+        )
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
