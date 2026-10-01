@@ -304,7 +304,9 @@ torch::Tensor get_scheduler_metadata(
     const int64_t window_size, const std::string& isa_hint,
     const bool enable_kv_split,
     const std::optional<torch::Tensor>& dynamic_causal,
-    const std::string& kv_cache_dtype);
+    const std::string& kv_cache_dtype,
+    const std::optional<torch::Tensor>& block_table, const int64_t block_size,
+    const int64_t hbm_blocks, const int64_t hbm_threads);
 
 void cpu_attn_reshape_and_cache(const torch::Tensor& key,
                                 const torch::Tensor& value,
@@ -877,7 +879,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int head_dim, Tensor seq_lens, ScalarType dtype, Tensor "
       "query_start_loc, bool casual, int window_size, str isa_hint, bool "
       "enable_kv_split, Tensor? dynamic_causal, "
-      "str kv_cache_dtype=\"auto\") -> Tensor",
+      "str kv_cache_dtype=\"auto\", Tensor? block_table=None, "
+      "int block_size=0, int hbm_blocks=0, int hbm_threads=0) -> Tensor",
       &get_scheduler_metadata);
   ops.def(
       "cpu_attn_reshape_and_cache(Tensor key, Tensor value, Tensor(a2!) "

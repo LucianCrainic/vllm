@@ -398,6 +398,12 @@ class AttentionScheduler {
     int32_t kv_block_alignment;  // context length alignment requirement
     bool enable_kv_split;
     bool* dynamic_causal;
+    const int32_t* block_table = nullptr;
+    int64_t block_table_stride = 0;
+    int32_t block_table_width = 0;
+    int32_t block_size = 0;
+    int32_t hbm_blocks = 0;
+    int32_t hbm_threads = 0;
   };
 
   static constexpr int32_t MaxQTileIterNum = 128;

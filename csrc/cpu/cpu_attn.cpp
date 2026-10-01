@@ -44,7 +44,9 @@ torch::Tensor get_scheduler_metadata(
     const int64_t window_size, const std::string& isa_hint,
     const bool enable_kv_split,
     const std::optional<torch::Tensor>& dynamic_causal,
-    const std::string& kv_cache_dtype) {
+    const std::string& kv_cache_dtype,
+    const std::optional<torch::Tensor>& block_table, const int64_t block_size,
+    const int64_t hbm_blocks, const int64_t hbm_threads) {
   cpu_attention::ISA isa;
   if (isa_hint == "amx") {
     isa = cpu_attention::ISA::AMX;
@@ -80,6 +82,18 @@ torch::Tensor get_scheduler_metadata(
   input.enable_kv_split = enable_kv_split;
   input.dynamic_causal =
       dynamic_causal.has_value() ? dynamic_causal->data_ptr<bool>() : nullptr;
+  if (block_table.has_value()) {
+    TORCH_CHECK(block_table->scalar_type() == at::ScalarType::Int);
+    TORCH_CHECK(block_table->dim() == 2);
+    TORCH_CHECK(block_table->size(0) >= num_req);
+    TORCH_CHECK(block_table->stride(1) == 1);
+    input.block_table = block_table->data_ptr<int32_t>();
+    input.block_table_stride = block_table->stride(0);
+    input.block_table_width = block_table->size(1);
+  }
+  input.block_size = block_size;
+  input.hbm_blocks = hbm_blocks;
+  input.hbm_threads = hbm_threads;
 
   const int64_t kv_cache_idx =
       static_cast<int64_t>(parse_fp8_kv_dtype(kv_cache_dtype));

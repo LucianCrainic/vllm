@@ -3850,6 +3850,10 @@ def cpu_attn_get_scheduler_metadata(
     enable_kv_split: bool,
     dynamic_causal: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
+    block_table: torch.Tensor | None = None,
+    block_size: int = 0,
+    hbm_blocks: int = 0,
+    hbm_threads: int = 0,
 ) -> torch.Tensor:
     scheduler_metadata = torch.ops._C.get_scheduler_metadata(
         num_reqs,
@@ -3865,6 +3869,10 @@ def cpu_attn_get_scheduler_metadata(
         enable_kv_split,
         dynamic_causal,
         kv_cache_dtype,
+        block_table,
+        block_size,
+        hbm_blocks,
+        hbm_threads,
     )
     return scheduler_metadata
 
