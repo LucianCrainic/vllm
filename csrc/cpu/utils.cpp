@@ -1,9 +1,14 @@
 #ifndef VLLM_NUMA_DISABLED
   #include <numa.h>
+  #include <numaif.h>
+  #include <sys/mman.h>
   #include <unistd.h>
   #include <string>
   #include <sched.h>
 #endif
+#include <ATen/ops/from_blob.h>
+#include <cerrno>
+#include <cstring>
 #if __GLIBC__ == 2 && __GLIBC_MINOR__ < 30
   #include <unistd.h>
   #include <sys/syscall.h>
@@ -87,6 +92,67 @@ void init_cpu_memory_env(std::vector<int64_t> node_ids) {
   }
 }
 #endif  // VLLM_NUMA_DISABLED
+
+torch::Tensor allocate_tiered_cpu_kv_cache(int64_t bytes, int64_t num_layers,
+                                           int64_t num_blocks,
+                                           int64_t hbm_blocks,
+                                           int64_t block_stride,
+                                           int64_t hbm_node, int64_t ddr_node) {
+#ifdef VLLM_NUMA_DISABLED
+  TORCH_CHECK(false, "Tiered CPU KV cache requires Linux NUMA support");
+#else
+  const int64_t page_size = sysconf(_SC_PAGESIZE);
+  TORCH_CHECK(bytes > 0 && num_layers > 0 && num_blocks > 0);
+  TORCH_CHECK(hbm_blocks > 0 && hbm_blocks <= num_blocks);
+  TORCH_CHECK(block_stride > 0 && block_stride % page_size == 0);
+  TORCH_CHECK(bytes == num_layers * num_blocks * block_stride);
+  TORCH_CHECK(hbm_node >= 0 && ddr_node >= 0 && hbm_node != ddr_node);
+  TORCH_CHECK(numa_available() >= 0);
+
+  bitmask* allowed = numa_get_mems_allowed();
+  TORCH_CHECK(allowed != nullptr);
+  const bool nodes_allowed = hbm_node < static_cast<int64_t>(allowed->size) &&
+                             ddr_node < static_cast<int64_t>(allowed->size) &&
+                             numa_bitmask_isbitset(allowed, hbm_node) &&
+                             numa_bitmask_isbitset(allowed, ddr_node);
+  numa_free_nodemask(allowed);
+  TORCH_CHECK(nodes_allowed, "Both tiered KV nodes must be allowed");
+
+  void* data = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  TORCH_CHECK(data != MAP_FAILED, "KV mmap failed: ", std::strerror(errno));
+
+  auto bind_range = [&](int64_t offset, int64_t length, int64_t node) {
+    if (!length) return;
+    bitmask* mask = numa_allocate_nodemask();
+    TORCH_CHECK(mask != nullptr);
+    numa_bitmask_setbit(mask, node);
+    const int result = mbind(static_cast<char*>(data) + offset, length,
+                             MPOL_BIND, mask->maskp, mask->size, 0);
+    const int saved_errno = errno;
+    numa_free_nodemask(mask);
+    TORCH_CHECK(result == 0, "KV mbind to node ", node,
+                " failed: ", std::strerror(saved_errno));
+  };
+
+  const int64_t layer_bytes = num_blocks * block_stride;
+  const int64_t hbm_bytes = hbm_blocks * block_stride;
+  try {
+    for (int64_t layer = 0; layer < num_layers; ++layer) {
+      bind_range(layer * layer_bytes, hbm_bytes, hbm_node);
+      bind_range(layer * layer_bytes + hbm_bytes, layer_bytes - hbm_bytes,
+                 ddr_node);
+    }
+  } catch (...) {
+    munmap(data, bytes);
+    throw;
+  }
+
+  return at::from_blob(
+      data, {bytes}, [bytes](void* ptr) { munmap(ptr, bytes); },
+      at::TensorOptions().dtype(at::kChar).device(at::kCPU));
+#endif
+}
 
 namespace cpu_utils {
 ScratchPadManager::ScratchPadManager() : size_(0), ptr_(nullptr) {

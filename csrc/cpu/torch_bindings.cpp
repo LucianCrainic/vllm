@@ -394,6 +394,11 @@ void mamba_chunk_scan_fwd_cpu_impl(at::Tensor& out, at::Tensor& final_states,
                                    const at::Tensor& cu_seqlens);
 
 void init_cpu_memory_env(std::vector<int64_t> node_ids);
+torch::Tensor allocate_tiered_cpu_kv_cache(int64_t bytes, int64_t num_layers,
+                                           int64_t num_blocks,
+                                           int64_t hbm_blocks,
+                                           int64_t block_stride,
+                                           int64_t hbm_node, int64_t ddr_node);
 
 namespace cpu_utils {
 void eagle_prepare_inputs_padded_kernel_impl(
@@ -968,6 +973,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       &mamba_chunk_scan_fwd_cpu_impl);
 
   ops.def("init_cpu_memory_env(SymInt[] node_ids) -> ()", &init_cpu_memory_env);
+  ops.def(
+      "allocate_tiered_cpu_kv_cache(int bytes, int num_layers, int "
+      "num_blocks, int hbm_blocks, int block_stride, int hbm_node, int "
+      "ddr_node) -> Tensor",
+      &allocate_tiered_cpu_kv_cache);
 
   // Speculative decoding kernels
   ops.def(
