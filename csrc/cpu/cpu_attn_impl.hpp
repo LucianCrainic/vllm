@@ -109,6 +109,7 @@ struct AttentionMetadata {
   int32_t thread_num;
   int32_t effective_thread_num;  // non-zero item num in workitem_num_per_thread
   int32_t split_kv_q_token_num_threshold;
+  int32_t tiered_hbm_threads = 0;
   int64_t attention_scratchpad_size_per_thread;
   int64_t reduction_scratchpad_size_per_kv_head;
   AttentionWorkItemGroup* workitem_groups_ptr;
@@ -116,6 +117,9 @@ struct AttentionMetadata {
   int32_t cu_workitem_num_per_thread[1025] = {
       0};  // prefix sum of workitem_num_per_thread
   char _padding2[56];
+  cpu_utils::Counter hbm_work_counter;
+  cpu_utils::Counter ddr_work_counter;
+  cpu_utils::Counter tiered_reduction_counter;
 
   AttentionMetadata(ISA isa, int32_t workitem_group_num,
                     int32_t reduction_item_num, int32_t reduction_split_num,
@@ -141,7 +145,12 @@ struct AttentionMetadata {
     TORCH_CHECK(reinterpret_cast<size_t>(this) % 64 == 0);
   }
 
-  void reset_counter() { counter.store(0); }
+  void reset_counter() {
+    counter.store(0);
+    hbm_work_counter.reset_counter();
+    ddr_work_counter.reset_counter();
+    tiered_reduction_counter.reset_counter();
+  }
 
   int64_t acquire_counter() { return counter++; }
 
@@ -1637,8 +1646,41 @@ class AttentionMainLoop {
       }
 
       // main loop
+      const bool tiered = metadata.tiered_hbm_threads > 0;
+      const int32_t primary_tier =
+          thread_id < metadata.tiered_hbm_threads ? 0 : 1;
+      bool primary_done = false;
+      bool secondary_done = false;
+      auto acquire_tier_task = [&](int32_t tier) -> int64_t {
+        const int32_t first_slot = tier == 0 ? 0 : metadata.tiered_hbm_threads;
+        const int32_t num_slots =
+            tier == 0 ? metadata.tiered_hbm_threads
+                      : effective_thread_num - metadata.tiered_hbm_threads;
+        const int64_t local_task =
+            tier == 0 ? metadata.hbm_work_counter.acquire_counter()
+                      : metadata.ddr_work_counter.acquire_counter();
+        if (local_task >= actual_kv_head_num * num_slots) return -1;
+        return (local_task / num_slots) * effective_thread_num + first_slot +
+               local_task % num_slots;
+      };
       for (;;) {
-        int64_t task_idx = metadata.acquire_counter();
+        int64_t task_idx = -1;
+        if (!tiered) {
+          task_idx = metadata.acquire_counter();
+        } else {
+          if (!primary_done) {
+            task_idx = acquire_tier_task(primary_tier);
+            primary_done = task_idx < 0;
+          }
+          if (task_idx < 0 && !secondary_done) {
+            task_idx = acquire_tier_task(1 - primary_tier);
+            secondary_done = task_idx < 0;
+          }
+          if (task_idx < 0) {
+            task_idx = workitem_groups_counter_num +
+                       metadata.tiered_reduction_counter.acquire_counter();
+          }
+        }
 
         if (task_idx >= total_counter_num) {
           // no more tasks, leave loop
