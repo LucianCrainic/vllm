@@ -5,8 +5,10 @@ from collections.abc import Sequence
 from typing import NamedTuple
 
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.cpu_tiered_kv import get_cpu_tiered_kv_config
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -93,12 +95,19 @@ class KVCacheCoordinator(ABC):
         self.scheduler_block_size = scheduler_block_size
         self.num_reprefillable_tokens = max(0, num_prefill_lookahead - 1)
 
+        tiered = (
+            get_cpu_tiered_kv_config(kv_cache_config)
+            if current_platform.is_cpu()
+            else None
+        )
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
             hash_block_size=hash_block_size,
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
+            hbm_blocks=tiered.hbm_blocks if tiered else None,
+            target_hbm_fraction=tiered.target_hbm_fraction if tiered else 0.67,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
