@@ -20,6 +20,7 @@ from vllm.utils.cpu_resource_utils import (
     get_memory_node_info,
     get_visible_memory_node,
 )
+from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.worker.cpu_model_runner import CPUModelRunner
@@ -44,6 +45,17 @@ class CPUWorker(Worker):
         allowed_memory_nodes = get_visible_memory_node()
         allowed_cpu_list = get_allowed_cpu_list()
         cpu_core = allowed_cpu_list[0]
+        self.tiered_kv = envs.VLLM_CPU_HBM_KV_CACHE_GIB > 0
+        if self.tiered_kv:
+            if vllm_config.cache_config.kv_cache_memory_bytes is None:
+                raise ValueError(
+                    "Tiered CPU KV requires --kv-cache-memory-bytes to size "
+                    "the combined HBM and DDR cache"
+                )
+            if cpu_core.numa_node != envs.VLLM_CPU_DDR_NODE:
+                raise ValueError("CPU cores must be local to VLLM_CPU_DDR_NODE")
+            if envs.VLLM_CPU_HBM_NODE not in allowed_memory_nodes:
+                raise ValueError("VLLM_CPU_HBM_NODE is not an allowed memory node")
 
         # TODO: some CI hosts are not correctly set, change to assertion
         # after fix
@@ -67,6 +79,8 @@ class CPUWorker(Worker):
             )
             memory_node = allowed_memory_nodes[0]
 
+        if self.tiered_kv:
+            memory_node = envs.VLLM_CPU_HBM_NODE
         torch.ops._C.init_cpu_memory_env([memory_node])
 
         memory_status = get_memory_node_info(memory_node)
@@ -207,6 +221,29 @@ class CPUWorker(Worker):
 
         allowed_cpu_list = get_allowed_cpu_list()
         cpu_core = allowed_cpu_list[0]
+
+        if self.tiered_kv:
+            hbm_budget = envs.VLLM_CPU_HBM_KV_CACHE_GIB * GiB_bytes
+            hbm_available = get_memory_node_info(
+                envs.VLLM_CPU_HBM_NODE
+            ).available_memory
+            ddr_available = get_memory_node_info(
+                envs.VLLM_CPU_DDR_NODE
+            ).available_memory
+            kv_cache_size = self.cache_config.kv_cache_memory_bytes
+            assert kv_cache_size is not None
+            if hbm_budget + 2 * GiB_bytes > hbm_available:
+                raise ValueError(
+                    "Not enough free HBM for the KV budget and 2 GiB headroom"
+                )
+            if kv_cache_size - hbm_budget > ddr_available:
+                raise ValueError("Not enough free DDR for the tiered KV cache")
+            logger.info(
+                "Tiered CPU KV: %.1f GiB HBM, %.1f GiB DDR budget",
+                hbm_budget / GiB_bytes,
+                max(0, kv_cache_size - hbm_budget) / GiB_bytes,
+            )
+            return kv_cache_size
 
         memory_status = get_memory_node_info(cpu_core.numa_node)
         available_memory = memory_status.available_memory
