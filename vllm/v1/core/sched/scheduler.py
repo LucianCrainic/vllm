@@ -1994,7 +1994,7 @@ class Scheduler(SchedulerInterface):
                 if self._tiered_feedback_steps % 64 == 0:
                     logger.info(
                         "Tiered CPU KV step %d: tokens=%s/%s, "
-                        "completion_ns=%s/%s, hbm_threads=%s, "
+                        "completion_ns=%s/%s, threads_hbm/ddr=%s/%s, "
                         "residency/target/last_tier=%s",
                         self._tiered_feedback_steps,
                         *tiered_stats,

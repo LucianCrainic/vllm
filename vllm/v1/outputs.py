@@ -305,7 +305,7 @@ class ModelRunnerOutput:
     sampling_masks: SamplingMaskLists | None = None
 
     # CPU tiered KV: HBM tokens, DDR tokens, HBM ns, DDR ns, HBM threads.
-    cpu_tiered_kv_stats: tuple[int, int, int, int, int] | None = None
+    cpu_tiered_kv_stats: tuple[int, int, int, int, int, int] | None = None
 
     @staticmethod
     def with_kv_conn_output_only(

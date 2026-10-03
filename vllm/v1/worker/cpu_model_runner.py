@@ -41,7 +41,7 @@ class CPUModelRunner(GPUModelRunner):
         self.cascade_attn_enabled = False
 
         self._postprocess_tensors()
-        self._pending_tiered_stats: tuple[int, int, int, int, int] | None = None
+        self._pending_tiered_stats: tuple[int, int, int, int, int, int] | None = None
         self._tiered_time_ema: list[float] | None = None
         self._tiered_valid_samples = 0
 
@@ -61,6 +61,7 @@ class CPUModelRunner(GPUModelRunner):
             hbm_ns,
             ddr_ns,
             hbm_threads,
+            thread_num - hbm_threads,
         )
         observed = [float(hbm_ns), float(ddr_ns)]
         if self._tiered_time_ema is None:
