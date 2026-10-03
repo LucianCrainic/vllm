@@ -581,21 +581,40 @@ def test_free_kv_cache_block_queue_initialization():
     assert queue.fake_free_list_tail.prev_free_block is block
 
 
-def test_tiered_free_block_queue_balances_allocations_and_reuses_blocks():
+def test_tiered_free_block_queue_fills_hbm_and_reuses_blocks():
     blocks = [KVCacheBlock(block_id=i) for i in range(16)]
-    queue = TieredFreeKVCacheBlockQueue(
-        blocks, hbm_blocks=8, target_hbm_fraction=0.5, stripe_blocks=2
-    )
+    queue = TieredFreeKVCacheBlockQueue(blocks, hbm_blocks=8)
 
     allocated = queue.popleft_n(8)
-    assert sum(block.block_id < 8 for block in allocated) == 4
-    assert sum(block.block_id >= 8 for block in allocated) == 4
-    assert queue.active_blocks == [4, 4]
+    assert all(block.block_id < 8 for block in allocated)
+    assert queue.active_blocks == [8, 0]
+
+    spilled = queue.popleft()
+    assert spilled.block_id >= 8
+    assert queue.active_blocks == [8, 1]
 
     queue.append_n(allocated)
+    queue.append(spilled)
     assert queue.active_blocks == [0, 0]
     assert queue.num_free_blocks == 16
-    assert {block.block_id for block in queue.get_all_free_blocks()} == set(range(16))
+    assert queue.popleft().block_id < 8
+    assert queue.active_blocks == [1, 0]
+
+
+def test_tiered_free_block_queue_uses_feedback_near_capacity():
+    blocks = [KVCacheBlock(block_id=i) for i in range(20)]
+    queue = TieredFreeKVCacheBlockQueue(blocks, hbm_blocks=10)
+    allocated = queue.popleft_n(9)
+    for _ in range(4):
+        queue.update_feedback(10, 10, 100, 10)
+
+    assert queue.popleft().block_id >= 10
+    assert queue.active_blocks == [9, 1]
+    assert queue.target_hbm_fraction < 1
+    queue.append_n(allocated)
+    assert queue.active_blocks == [0, 1]
+    assert queue.popleft().block_id < 10
+    assert queue.num_free_blocks == 18
 
 
 def test_free_kv_cache_block_queue_operations():

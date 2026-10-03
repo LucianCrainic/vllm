@@ -6,6 +6,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.config import (
     CompilationMode,
     VllmConfig,
@@ -13,7 +15,11 @@ from vllm.config import (
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.tracing import instrument
+from vllm.v1.attention.backends.cpu_attn import (
+    CPUAttentionMetadataBuilder,
+)
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
+from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -35,6 +41,57 @@ class CPUModelRunner(GPUModelRunner):
         self.cascade_attn_enabled = False
 
         self._postprocess_tensors()
+        self._pending_tiered_stats: tuple[int, int, int, int, int] | None = None
+        self._tiered_time_ema: list[float] | None = None
+        self._tiered_valid_samples = 0
+
+    def _after_model_forward(self, attn_metadata: Any) -> None:
+        if not envs.VLLM_CPU_HBM_KV_CACHE_GIB or not isinstance(attn_metadata, dict):
+            return
+        metadata = next(iter(attn_metadata.values()), None)
+        if metadata is None or metadata.scheduler_metadata is None:
+            return
+        stats = ops.cpu_attn_get_tiered_stats(metadata.scheduler_metadata)
+        if len(stats) != 6 or min(stats[:4]) <= 0:
+            return
+        hbm_tokens, ddr_tokens, hbm_ns, ddr_ns, hbm_threads, thread_num = stats
+        self._pending_tiered_stats = (
+            hbm_tokens,
+            ddr_tokens,
+            hbm_ns,
+            ddr_ns,
+            hbm_threads,
+        )
+        observed = [float(hbm_ns), float(ddr_ns)]
+        if self._tiered_time_ema is None:
+            self._tiered_time_ema = observed
+        else:
+            self._tiered_time_ema = [
+                0.8 * old + 0.2 * new
+                for old, new in zip(self._tiered_time_ema, observed)
+            ]
+        self._tiered_valid_samples += 1
+        if envs.VLLM_CPU_TIERED_ATTN_HBM_THREADS:
+            return
+        if self._tiered_valid_samples == 1:
+            CPUAttentionMetadataBuilder.adaptive_hbm_threads = hbm_threads
+        if self._tiered_valid_samples % 16 == 0:
+            hbm_time, ddr_time = self._tiered_time_ema
+            change = int(hbm_time > ddr_time * 1.1) - int(ddr_time > hbm_time * 1.1)
+            CPUAttentionMetadataBuilder.adaptive_hbm_threads = max(
+                1,
+                min(
+                    thread_num - 1,
+                    CPUAttentionMetadataBuilder.adaptive_hbm_threads + change,
+                ),
+            )
+
+    def sample_tokens(self, *args: Any, **kwargs: Any) -> Any:
+        output = super().sample_tokens(*args, **kwargs)
+        if isinstance(output, ModelRunnerOutput):
+            output.cpu_tiered_kv_stats = self._pending_tiered_stats
+        self._pending_tiered_stats = None
+        return output
 
     def _postprocess_tensors(self) -> None:
         # Note: replace device tensors with cpu tensors

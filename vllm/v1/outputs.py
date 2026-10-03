@@ -304,6 +304,9 @@ class ModelRunnerOutput:
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
 
+    # CPU tiered KV: HBM tokens, DDR tokens, HBM ns, DDR ns, HBM threads.
+    cpu_tiered_kv_stats: tuple[int, int, int, int, int] | None = None
+
     @staticmethod
     def with_kv_conn_output_only(
         kv_connector_output: KVConnectorOutput | None,

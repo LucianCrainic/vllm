@@ -19,7 +19,6 @@ class CPUTieredKVConfig:
     hbm_node: int
     ddr_node: int
     hbm_blocks: int
-    target_hbm_fraction: float
     hbm_attention_threads: int
 
 
@@ -71,14 +70,9 @@ def get_cpu_tiered_kv_config(
         raise ValueError("Tiered CPU KV requires a dense layer-outermost layout")
     bytes_per_block = len(tensor.layers) * tensor.block_stride
     hbm_blocks = min(num_blocks, hbm_gib * GiB_bytes // bytes_per_block)
-    if not 1 < hbm_blocks < num_blocks:
-        raise ValueError(
-            "Tiered CPU KV requires at least two HBM blocks and DDR capacity"
-        )
+    if hbm_blocks < 2:
+        raise ValueError("Tiered CPU KV requires at least two HBM blocks")
 
-    fraction = envs.VLLM_CPU_TIERED_KV_HBM_FRACTION
-    if not 0 < fraction < 1:
-        raise ValueError("VLLM_CPU_TIERED_KV_HBM_FRACTION must be in (0, 1)")
     hbm_threads = envs.VLLM_CPU_TIERED_ATTN_HBM_THREADS
     if hbm_threads < 0:
         raise ValueError("VLLM_CPU_TIERED_ATTN_HBM_THREADS must be nonnegative")
@@ -86,6 +80,5 @@ def get_cpu_tiered_kv_config(
         hbm_node=hbm_node,
         ddr_node=ddr_node,
         hbm_blocks=hbm_blocks,
-        target_hbm_fraction=fraction,
         hbm_attention_threads=hbm_threads,
     )

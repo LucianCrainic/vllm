@@ -479,6 +479,9 @@ class ExecuteModelState(NamedTuple):
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    def _after_model_forward(self, attn_metadata: PerLayerAttnMetadata) -> None:
+        pass
+
     @JitWarmupRegistry.capture
     def __init__(
         self,
@@ -4431,6 +4434,7 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            self._after_model_forward(attn_metadata)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

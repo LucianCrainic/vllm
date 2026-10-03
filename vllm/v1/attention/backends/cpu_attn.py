@@ -134,6 +134,8 @@ class CPUAttentionMetadata:
 
 
 class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]):
+    adaptive_hbm_threads: ClassVar[int] = 0
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -160,10 +162,14 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         self.block_size = kv_cache_spec.block_size
         self.hbm_blocks = 0
         if envs.VLLM_CPU_HBM_KV_CACHE_GIB:
+            bytes_per_block = len(layer_names) * kv_cache_spec.page_size_bytes
+            hbm_bytes = envs.VLLM_CPU_HBM_KV_CACHE_GIB * GiB_bytes
             self.hbm_blocks = (
-                envs.VLLM_CPU_HBM_KV_CACHE_GIB
-                * GiB_bytes
-                // (len(layer_names) * kv_cache_spec.page_size_bytes)
+                min(
+                    hbm_bytes,
+                    self.vllm_config.cache_config.kv_cache_memory_bytes or hbm_bytes,
+                )
+                // bytes_per_block
             )
         self.kv_cache_dtype = vllm_config.cache_config.cache_dtype
         self.isa = _get_attn_isa(
@@ -279,7 +285,10 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             block_table=block_table_tensor if self.hbm_blocks else None,
             block_size=self.block_size,
             hbm_blocks=self.hbm_blocks,
-            hbm_threads=envs.VLLM_CPU_TIERED_ATTN_HBM_THREADS,
+            hbm_threads=(
+                envs.VLLM_CPU_TIERED_ATTN_HBM_THREADS or self.adaptive_hbm_threads
+            ),
+            enable_tiered_schedule=envs.VLLM_CPU_TIERED_ATTN_SCHEDULE,
         )
 
         attn_metadata = CPUAttentionMetadata(

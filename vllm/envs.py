@@ -57,7 +57,8 @@ if TYPE_CHECKING:
     VLLM_CPU_HBM_KV_CACHE_GIB: int = 0
     VLLM_CPU_HBM_NODE: int = -1
     VLLM_CPU_DDR_NODE: int = -1
-    VLLM_CPU_TIERED_KV_HBM_FRACTION: float = 0.67
+    VLLM_CPU_TIERED_WEIGHTS_TIER: str = "hbm"
+    VLLM_CPU_TIERED_ATTN_SCHEDULE: bool = True
     VLLM_CPU_TIERED_ATTN_HBM_THREADS: int = 0
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
     VLLM_CPU_INT4_W4A8: bool = True
@@ -910,8 +911,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_CPU_HBM_NODE": lambda: int(os.getenv("VLLM_CPU_HBM_NODE", "-1")),
     "VLLM_CPU_DDR_NODE": lambda: int(os.getenv("VLLM_CPU_DDR_NODE", "-1")),
-    "VLLM_CPU_TIERED_KV_HBM_FRACTION": lambda: float(
-        os.getenv("VLLM_CPU_TIERED_KV_HBM_FRACTION", "0.67")
+    "VLLM_CPU_TIERED_WEIGHTS_TIER": lambda: os.getenv(
+        "VLLM_CPU_TIERED_WEIGHTS_TIER", "hbm"
+    ).lower(),
+    "VLLM_CPU_TIERED_ATTN_SCHEDULE": lambda: bool(
+        int(os.getenv("VLLM_CPU_TIERED_ATTN_SCHEDULE", "1"))
     ),
     "VLLM_CPU_TIERED_ATTN_HBM_THREADS": lambda: int(
         os.getenv("VLLM_CPU_TIERED_ATTN_HBM_THREADS", "0")

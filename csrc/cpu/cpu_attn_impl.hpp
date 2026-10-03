@@ -2,6 +2,7 @@
 #define CPU_ATTN_HPP
 
 #include <algorithm>
+#include <chrono>
 #include <type_traits>
 #include <cstddef>
 #include <cmath>
@@ -101,7 +102,7 @@ struct ReductionWorkItemGroup {
   }
 };
 
-struct AttentionMetadata {
+struct alignas(64) AttentionMetadata {
   std::atomic_int64_t counter;
   char _padding1[56];
   ISA isa;
@@ -112,6 +113,9 @@ struct AttentionMetadata {
   int32_t effective_thread_num;  // non-zero item num in workitem_num_per_thread
   int32_t split_kv_q_token_num_threshold;
   int32_t tiered_hbm_threads = 0;
+  int64_t tier_tokens[2] = {0, 0};
+  int64_t tier_completion_ns[2] = {0, 0};
+  int32_t tier_invocations = 0;
   int64_t attention_scratchpad_size_per_thread;
   int64_t reduction_scratchpad_size_per_kv_head;
   AttentionWorkItemGroup* workitem_groups_ptr;
@@ -415,6 +419,7 @@ class AttentionScheduler {
     int32_t block_size = 0;
     int32_t hbm_blocks = 0;
     int32_t hbm_threads = 0;
+    bool enable_tiered_schedule = true;
   };
 
   static constexpr int32_t MaxQTileIterNum = 128;
@@ -437,9 +442,10 @@ class AttentionScheduler {
       has_decode_request = has_decode_request || (q_token_num == 1);
       decode_only_batch = decode_only_batch && (q_token_num == 1);
     }
-    if (input.hbm_blocks > 0 && input.block_table != nullptr &&
-        input.enable_kv_split && decode_only_batch && input.causal &&
-        input.dynamic_causal == nullptr && input.sliding_window_size == -1) {
+    if (input.enable_tiered_schedule && input.hbm_blocks > 0 &&
+        input.block_table != nullptr && input.enable_kv_split &&
+        decode_only_batch && input.causal && input.dynamic_causal == nullptr &&
+        input.sliding_window_size == -1) {
       return schedule_tiered_decode(input);
     }
     const int32_t original_q_head_per_kv =
@@ -830,9 +836,9 @@ class AttentionScheduler {
     const int32_t hbm_threads =
         input.hbm_threads > 0
             ? input.hbm_threads
-            : std::clamp(static_cast<int32_t>(std::round(
-                             thread_num * tier_tokens[0] /
-                             (tier_tokens[0] + 1.3 * tier_tokens[1]))),
+            : std::clamp(static_cast<int32_t>(
+                             std::round(thread_num * tier_tokens[0] /
+                                        (tier_tokens[0] + tier_tokens[1]))),
                          1, thread_num - 1);
     TORCH_CHECK_GT(hbm_threads, 0);
     TORCH_CHECK_LT(hbm_threads, thread_num);
@@ -908,6 +914,8 @@ class AttentionScheduler {
     auto* metadata = new (metadata_tensor.data_ptr()) AttentionMetadata(
         input.isa, workitems.size(), reduce_workitems.size(), split_count, 1);
     metadata->tiered_hbm_threads = hbm_threads;
+    metadata->tier_tokens[0] = tier_tokens[0];
+    metadata->tier_tokens[1] = tier_tokens[1];
     metadata->effective_thread_num = thread_num;
     std::memcpy(metadata->workitem_groups_ptr, workitems.data(),
                 workitems.size() * sizeof(AttentionWorkItemGroup));
@@ -1720,6 +1728,9 @@ class AttentionMainLoop {
     TORCH_CHECK_EQ(input->metadata->thread_num, thread_num);
     std::atomic<int32_t> guard_counter(0);
     std::atomic<int32_t>* guard_counter_ptr = &guard_counter;
+    const bool measure_tiers = input->metadata->tiered_hbm_threads > 0;
+    const auto tier_start = std::chrono::steady_clock::now();
+    std::atomic<int64_t> tier_finish_ns[2]{};
 
 #pragma omp parallel for schedule(static, 1)
     for (int thread_id = 0; thread_id < thread_num; ++thread_id) {
@@ -1876,6 +1887,8 @@ class AttentionMainLoop {
           // map task_idx to workitem_groups
           const int32_t kv_head_idx = task_idx / effective_thread_num;
           const int32_t thread_offset = task_idx % effective_thread_num;
+          const int32_t work_tier =
+              thread_offset < metadata.tiered_hbm_threads ? 0 : 1;
           AttentionWorkItemGroup* const curr_workitem_groups =
               workitem_groups + cu_workitem_num_per_thread[thread_offset];
           const int32_t curr_workitem_groups_num =
@@ -2198,6 +2211,17 @@ class AttentionMainLoop {
               }
             }
           }
+          if (measure_tiers) {
+            const int64_t elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - tier_start)
+                    .count();
+            int64_t previous = tier_finish_ns[work_tier].load();
+            while (previous < elapsed &&
+                   !tier_finish_ns[work_tier].compare_exchange_weak(previous,
+                                                                    elapsed)) {
+            }
+          }
         } else {
           task_idx -= workitem_groups_counter_num;
           const int32_t kv_head_idx = task_idx / reduction_item_num;
@@ -2253,6 +2277,13 @@ class AttentionMainLoop {
               q_head_num, output_v_scale);
         }
       }
+    }
+    if (measure_tiers) {
+      for (int tier = 0; tier < 2; ++tier) {
+        input->metadata->tier_completion_ns[tier] +=
+            tier_finish_ns[tier].load();
+      }
+      ++input->metadata->tier_invocations;
     }
     // Reset counter for next call
     input->metadata->reset_counter();

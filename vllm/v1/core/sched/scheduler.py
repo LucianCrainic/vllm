@@ -1981,6 +1981,19 @@ class Scheduler(SchedulerInterface):
         kv_connector_output = model_runner_output.kv_connector_output
         ec_connector_output = model_runner_output.ec_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        tiered_stats = model_runner_output.cpu_tiered_kv_stats
+        if tiered_stats is not None:
+            from vllm.v1.core.kv_cache_utils import TieredFreeKVCacheBlockQueue
+
+            queue = self.kv_cache_manager.block_pool.free_block_queue
+            if isinstance(queue, TieredFreeKVCacheBlockQueue):
+                queue.update_feedback(*tiered_stats[:4])
+                logger.debug(
+                    "Tiered CPU KV: tokens=%s/%s, completion_ns=%s/%s, "
+                    "hbm_threads=%s, residency/target/last_tier=%s",
+                    *tiered_stats,
+                    queue.tier_snapshot(),
+                )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.

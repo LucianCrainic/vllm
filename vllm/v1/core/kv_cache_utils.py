@@ -498,28 +498,25 @@ class FreeKVCacheBlockQueue:
 
 
 class TieredFreeKVCacheBlockQueue:
-    """Two free lists with allocation-time balancing and stable block tiers."""
+    """HBM-first allocation with measured near-capacity tier balancing."""
 
     def __init__(
         self,
         blocks: list[KVCacheBlock],
         hbm_blocks: int,
-        target_hbm_fraction: float,
-        stripe_blocks: int = 32,
     ) -> None:
         assert 0 < hbm_blocks <= len(blocks)
-        assert 0 < target_hbm_fraction < 1
-        assert stripe_blocks > 0
         self.hbm_blocks = hbm_blocks
-        self.target_hbm_fraction = target_hbm_fraction
-        self.stripe_blocks = stripe_blocks
         self.queues = (
             FreeKVCacheBlockQueue(blocks[:hbm_blocks]),
             FreeKVCacheBlockQueue(blocks[hbm_blocks:]),
         )
         self.active_blocks = [0, 0]
-        self.stripe_tier = 0
-        self.stripe_remaining = 0
+        self.hbm_headroom_blocks = max(1, hbm_blocks // 10)
+        self.tier_rate: list[float] | None = None
+        self.target_hbm_fraction = 1.0
+        self.valid_samples = 0
+        self.last_selected_tier = 0
 
     @property
     def num_free_blocks(self) -> int:
@@ -535,9 +532,39 @@ class TieredFreeKVCacheBlockQueue:
             return 1
         if not ddr_free:
             return 0
-        hbm_load = self.active_blocks[0] / self.target_hbm_fraction
-        ddr_load = self.active_blocks[1] / (1 - self.target_hbm_fraction)
-        return 0 if hbm_load <= ddr_load else 1
+        if hbm_free > self.hbm_headroom_blocks or self.valid_samples < 4:
+            return 0
+        hbm_time = (self.active_blocks[0] + 1) / self.target_hbm_fraction
+        ddr_time = (self.active_blocks[1] + 1) / (1 - self.target_hbm_fraction)
+        return int(hbm_time > ddr_time * 1.05)
+
+    def update_feedback(
+        self, hbm_tokens: int, ddr_tokens: int, hbm_ns: int, ddr_ns: int
+    ) -> None:
+        """Use decode attention completion times as effective tier rates."""
+        if min(hbm_tokens, ddr_tokens, hbm_ns, ddr_ns) <= 0:
+            return
+        observed = [hbm_tokens / hbm_ns, ddr_tokens / ddr_ns]
+        if self.tier_rate is None:
+            self.tier_rate = observed
+        else:
+            self.tier_rate = [
+                0.8 * old + 0.2 * new for old, new in zip(self.tier_rate, observed)
+            ]
+        self.valid_samples += 1
+        hbm_rate, ddr_rate = self.tier_rate
+        desired = hbm_rate / (hbm_rate + ddr_rate)
+        self.target_hbm_fraction += max(
+            -0.05, min(0.05, desired - self.target_hbm_fraction)
+        )
+
+    def tier_snapshot(self) -> tuple[int, int, float, int]:
+        return (
+            self.active_blocks[0],
+            self.active_blocks[1],
+            self.target_hbm_fraction,
+            self.last_selected_tier,
+        )
 
     def popleft(self) -> KVCacheBlock:
         return self.popleft_n(1)[0]
@@ -547,18 +574,11 @@ class TieredFreeKVCacheBlockQueue:
             raise ValueError(f"Cannot get {n} free blocks from the pool")
         result: list[KVCacheBlock] = []
         while n:
-            if (
-                not self.stripe_remaining
-                or not self.queues[self.stripe_tier].num_free_blocks
-            ):
-                self.stripe_tier = self._next_tier()
-                self.stripe_remaining = self.stripe_blocks
-            tier = self.stripe_tier
-            count = min(n, self.stripe_remaining, self.queues[tier].num_free_blocks)
-            result.extend(self.queues[tier].popleft_n(count))
-            self.active_blocks[tier] += count
-            self.stripe_remaining -= count
-            n -= count
+            tier = self._next_tier()
+            result.append(self.queues[tier].popleft())
+            self.active_blocks[tier] += 1
+            self.last_selected_tier = tier
+            n -= 1
         return result
 
     def remove(self, block: KVCacheBlock) -> None:

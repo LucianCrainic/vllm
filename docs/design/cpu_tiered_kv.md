@@ -3,12 +3,15 @@
 This opt-in path targets a CPU socket with two local NUMA memory nodes: one HBM
 and one DDR. Bind the inference threads to cores on that socket. Keep both
 memory nodes available to the process. The CPU worker binds model loading to
-HBM, then allocates each layer's KV cache with an HBM block prefix and a DDR
-block suffix using Linux `mbind`. A block retains its tier for its lifetime;
+HBM by default, then allocates each layer's KV cache with an HBM block prefix
+and a DDR block suffix using Linux `mbind`. Weights may instead be loaded into
+DDR to reserve more HBM for KV. A block retains its tier for its lifetime;
 there is no page migration in the attention path.
 
-The block pool assigns new blocks in short tier stripes and aims for a chosen
-HBM fraction among allocated blocks. During causal decode, the attention
+The block pool fills HBM first. Near its capacity limit, it uses smoothed
+per-tier attention completion times to choose the tier for new blocks. Until
+both tiers have produced enough measurements, it keeps allocating in HBM.
+During causal decode, the attention
 scheduler reads the block table, creates work for contiguous runs in each tier,
 and gives HBM and DDR work to separate OpenMP thread groups. It merges partial
 outputs with the existing split-KV softmax reduction. Prefill, sliding-window
@@ -18,12 +21,14 @@ scheduler.
 ## Configuration
 
 - `VLLM_CPU_HBM_NODE` and `VLLM_CPU_DDR_NODE`: distinct local NUMA node IDs.
-- `VLLM_CPU_HBM_KV_CACHE_GIB`: HBM capacity reserved for KV, in GiB. The
-  configured total `--kv-cache-memory-bytes` must exceed this budget.
-- `VLLM_CPU_TIERED_KV_HBM_FRACTION`: target fraction of allocated blocks in
-  HBM; default `0.67`.
+- `VLLM_CPU_HBM_KV_CACHE_GIB`: HBM capacity reserved for KV, in GiB. It may
+  cover the entire configured `--kv-cache-memory-bytes` pool.
+- `VLLM_CPU_TIERED_WEIGHTS_TIER`: `hbm` (default) or `ddr`. Only model loading
+  changes tier; subsequent non-KV allocations use HBM.
 - `VLLM_CPU_TIERED_ATTN_HBM_THREADS`: number of attention threads initially
-  assigned to HBM; `0` estimates a split from the current decode batch.
+  assigned to HBM; `0` adapts the split from measured tier completion times.
+- `VLLM_CPU_TIERED_ATTN_SCHEDULE=0`: disable tier-aware scheduling while
+  retaining upstream split-KV for a clean ablation.
 - `VLLM_CPU_OMP_THREADS_BIND`: explicitly list cores on the selected socket.
 - `VLLM_CPU_ATTN_SPLIT_KV=1`: enables concurrent tier scheduling during decode.
 
@@ -45,6 +50,9 @@ residency, memory bandwidth per tier, and output agreement with the standard
 CPU attention path. A useful balance minimizes the slower of the two tier
 completion times, including AMX compute and softmax reduction costs.
 
-The first implementation uses active block counts as a placement proxy and
-scans block tables each decode step. Fragmented prefix-cache blocks can create
-more tier runs and reduction work; measure this case separately.
+The worker returns tier token counts, completion times, and thread split to
+the scheduler after each dual-tier decode step. Debug logs include these
+measurements plus actual HBM/DDR residency, the smoothed target, and the last
+allocation tier. New blocks respond to feedback; active blocks do not move.
+Fragmented prefix-cache blocks can create more tier runs and reduction work;
+measure this case separately.

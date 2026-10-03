@@ -306,7 +306,10 @@ torch::Tensor get_scheduler_metadata(
     const std::optional<torch::Tensor>& dynamic_causal,
     const std::string& kv_cache_dtype,
     const std::optional<torch::Tensor>& block_table, const int64_t block_size,
-    const int64_t hbm_blocks, const int64_t hbm_threads);
+    const int64_t hbm_blocks, const int64_t hbm_threads,
+    const bool enable_tiered_schedule);
+std::vector<int64_t> get_tiered_attention_stats(
+    const torch::Tensor& scheduler_metadata);
 
 void cpu_attn_reshape_and_cache(const torch::Tensor& key,
                                 const torch::Tensor& value,
@@ -880,8 +883,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "query_start_loc, bool casual, int window_size, str isa_hint, bool "
       "enable_kv_split, Tensor? dynamic_causal, "
       "str kv_cache_dtype=\"auto\", Tensor? block_table=None, "
-      "int block_size=0, int hbm_blocks=0, int hbm_threads=0) -> Tensor",
+      "int block_size=0, int hbm_blocks=0, int hbm_threads=0, "
+      "bool enable_tiered_schedule=True) -> Tensor",
       &get_scheduler_metadata);
+  ops.def("get_tiered_attention_stats(Tensor metadata) -> int[]",
+          &get_tiered_attention_stats);
   ops.def(
       "cpu_attn_reshape_and_cache(Tensor key, Tensor value, Tensor(a2!) "
       "key_cache, Tensor(a3!) value_cache, Tensor slot_mapping, str isa, "

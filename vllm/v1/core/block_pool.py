@@ -163,7 +163,6 @@ class BlockPool:
         metrics_collector: KVCacheMetricsCollector | None = None,
         medium: str = MEDIUM_GPU,
         hbm_blocks: int | None = None,
-        target_hbm_fraction: float = 0.67,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -180,9 +179,7 @@ class BlockPool:
         self.free_block_queue = (
             FreeKVCacheBlockQueue(self.blocks)
             if hbm_blocks is None
-            else TieredFreeKVCacheBlockQueue(
-                self.blocks, hbm_blocks, target_hbm_fraction
-            )
+            else TieredFreeKVCacheBlockQueue(self.blocks, hbm_blocks)
         )
 
         # Cache for block lookup

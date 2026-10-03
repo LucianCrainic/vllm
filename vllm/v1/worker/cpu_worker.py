@@ -47,6 +47,8 @@ class CPUWorker(Worker):
         cpu_core = allowed_cpu_list[0]
         self.tiered_kv = envs.VLLM_CPU_HBM_KV_CACHE_GIB > 0
         if self.tiered_kv:
+            if envs.VLLM_CPU_TIERED_WEIGHTS_TIER not in ("hbm", "ddr"):
+                raise ValueError("VLLM_CPU_TIERED_WEIGHTS_TIER must be hbm or ddr")
             if vllm_config.cache_config.kv_cache_memory_bytes is None:
                 raise ValueError(
                     "Tiered CPU KV requires --kv-cache-memory-bytes to size "
@@ -118,6 +120,16 @@ class CPUWorker(Worker):
 
         self.parallel_config.disable_custom_all_reduce = True
 
+    def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        if self.tiered_kv and envs.VLLM_CPU_TIERED_WEIGHTS_TIER == "ddr":
+            torch.ops._C.init_cpu_memory_env([envs.VLLM_CPU_DDR_NODE])
+            try:
+                super().load_model(load_dummy_weights=load_dummy_weights)
+            finally:
+                torch.ops._C.init_cpu_memory_env([envs.VLLM_CPU_HBM_NODE])
+        else:
+            super().load_model(load_dummy_weights=load_dummy_weights)
+
     def init_device(self):
         self.device = torch.device("cpu")
 
@@ -179,6 +191,8 @@ class CPUWorker(Worker):
         set_random_seed(self.model_config.seed)
 
         # Construct the model runner
+        if self.tiered_kv and self.use_v2_model_runner:
+            raise ValueError("Tiered CPU KV requires the V1 CPU model runner")
         if self.use_v2_model_runner:
             from vllm.v1.worker.cpu.model_runner import (
                 CPUModelRunner as CPUModelRunnerV2,
@@ -223,20 +237,20 @@ class CPUWorker(Worker):
         cpu_core = allowed_cpu_list[0]
 
         if self.tiered_kv:
-            hbm_budget = envs.VLLM_CPU_HBM_KV_CACHE_GIB * GiB_bytes
+            kv_cache_size = self.cache_config.kv_cache_memory_bytes
+            assert kv_cache_size is not None
+            hbm_budget = min(envs.VLLM_CPU_HBM_KV_CACHE_GIB * GiB_bytes, kv_cache_size)
             hbm_available = get_memory_node_info(
                 envs.VLLM_CPU_HBM_NODE
             ).available_memory
             ddr_available = get_memory_node_info(
                 envs.VLLM_CPU_DDR_NODE
             ).available_memory
-            kv_cache_size = self.cache_config.kv_cache_memory_bytes
-            assert kv_cache_size is not None
             if hbm_budget + 2 * GiB_bytes > hbm_available:
                 raise ValueError(
                     "Not enough free HBM for the KV budget and 2 GiB headroom"
                 )
-            if kv_cache_size - hbm_budget > ddr_available:
+            if kv_cache_size - hbm_budget + 2 * GiB_bytes > ddr_available:
                 raise ValueError("Not enough free DDR for the tiered KV cache")
             logger.info(
                 "Tiered CPU KV: %.1f GiB HBM, %.1f GiB DDR budget",

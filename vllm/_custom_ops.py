@@ -3854,6 +3854,7 @@ def cpu_attn_get_scheduler_metadata(
     block_size: int = 0,
     hbm_blocks: int = 0,
     hbm_threads: int = 0,
+    enable_tiered_schedule: bool = True,
 ) -> torch.Tensor:
     scheduler_metadata = torch.ops._C.get_scheduler_metadata(
         num_reqs,
@@ -3873,8 +3874,13 @@ def cpu_attn_get_scheduler_metadata(
         block_size,
         hbm_blocks,
         hbm_threads,
+        enable_tiered_schedule,
     )
     return scheduler_metadata
+
+
+def cpu_attn_get_tiered_stats(metadata: torch.Tensor) -> list[int]:
+    return torch.ops._C.get_tiered_attention_stats(metadata)
 
 
 def cpu_attn_reshape_and_cache(

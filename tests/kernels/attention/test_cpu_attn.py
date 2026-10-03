@@ -24,6 +24,7 @@ if not current_platform.is_cpu():
 from vllm._custom_ops import (
     cpu_attention_with_kv_cache,
     cpu_attn_get_scheduler_metadata,
+    cpu_attn_get_tiered_stats,
     cpu_attn_reshape_and_cache,
 )
 
@@ -103,7 +104,9 @@ def test_tiered_decode_matches_standard_attention_for_interleaved_blocks():
     seq_lens = torch.tensor([300, 256], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 1, 2], dtype=torch.int32)
 
-    def run(hbm_blocks: int) -> torch.Tensor:
+    def run(
+        hbm_blocks: int, enable_tiered_schedule: bool = True
+    ) -> tuple[torch.Tensor, list[int]]:
         metadata = cpu_attn_get_scheduler_metadata(
             num_reqs=2,
             num_heads=num_heads,
@@ -119,6 +122,7 @@ def test_tiered_decode_matches_standard_attention_for_interleaved_blocks():
             block_table=block_table if hbm_blocks else None,
             block_size=block_size,
             hbm_blocks=hbm_blocks,
+            enable_tiered_schedule=enable_tiered_schedule,
         )
         output = torch.empty_like(query)
         cpu_attention_with_kv_cache(
@@ -137,11 +141,15 @@ def test_tiered_decode_matches_standard_attention_for_interleaved_blocks():
             scheduler_metadata=metadata,
             s_aux=None,
         )
-        return output
+        return output, cpu_attn_get_tiered_stats(metadata)
 
-    torch.testing.assert_close(
-        run(hbm_blocks=2), run(hbm_blocks=0), atol=0.03, rtol=0.03
-    )
+    tiered_output, tiered_stats = run(hbm_blocks=2)
+    regular_output, _ = run(hbm_blocks=0)
+    ablated_output, ablated_stats = run(hbm_blocks=2, enable_tiered_schedule=False)
+    torch.testing.assert_close(tiered_output, regular_output, atol=0.03, rtol=0.03)
+    torch.testing.assert_close(ablated_output, regular_output, atol=0.03, rtol=0.03)
+    assert min(tiered_stats[:4]) > 0
+    assert ablated_stats[:4] == [0, 0, 0, 0]
 
 
 # rand number generation takes too much time, cache rand tensors

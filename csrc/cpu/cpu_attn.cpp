@@ -46,7 +46,8 @@ torch::Tensor get_scheduler_metadata(
     const std::optional<torch::Tensor>& dynamic_causal,
     const std::string& kv_cache_dtype,
     const std::optional<torch::Tensor>& block_table, const int64_t block_size,
-    const int64_t hbm_blocks, const int64_t hbm_threads) {
+    const int64_t hbm_blocks, const int64_t hbm_threads,
+    const bool enable_tiered_schedule) {
   cpu_attention::ISA isa;
   if (isa_hint == "amx") {
     isa = cpu_attention::ISA::AMX;
@@ -94,6 +95,7 @@ torch::Tensor get_scheduler_metadata(
   input.block_size = block_size;
   input.hbm_blocks = hbm_blocks;
   input.hbm_threads = hbm_threads;
+  input.enable_tiered_schedule = enable_tiered_schedule;
 
   const int64_t kv_cache_idx =
       static_cast<int64_t>(parse_fp8_kv_dtype(kv_cache_dtype));
@@ -112,6 +114,22 @@ torch::Tensor get_scheduler_metadata(
   cpu_attention::AttentionScheduler scheduler;
   torch::Tensor metadata = scheduler.schedule(input);
   return metadata;
+}
+
+std::vector<int64_t> get_tiered_attention_stats(
+    const torch::Tensor& scheduler_metadata) {
+  TORCH_CHECK(scheduler_metadata.device().is_cpu());
+  TORCH_CHECK(scheduler_metadata.numel() >=
+              static_cast<int64_t>(sizeof(cpu_attention::AttentionMetadata)));
+  const auto* metadata =
+      reinterpret_cast<const cpu_attention::AttentionMetadata*>(
+          scheduler_metadata.data_ptr());
+  return {metadata->tier_tokens[0] * metadata->tier_invocations,
+          metadata->tier_tokens[1] * metadata->tier_invocations,
+          metadata->tier_completion_ns[0],
+          metadata->tier_completion_ns[1],
+          metadata->tiered_hbm_threads,
+          metadata->thread_num};
 }
 
 void cpu_attn_reshape_and_cache(

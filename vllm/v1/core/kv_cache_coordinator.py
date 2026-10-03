@@ -107,7 +107,6 @@ class KVCacheCoordinator(ABC):
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
             hbm_blocks=tiered.hbm_blocks if tiered else None,
-            target_hbm_fraction=tiered.target_hbm_fraction if tiered else 0.67,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.
