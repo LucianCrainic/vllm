@@ -1988,12 +1988,18 @@ class Scheduler(SchedulerInterface):
             queue = self.kv_cache_manager.block_pool.free_block_queue
             if isinstance(queue, TieredFreeKVCacheBlockQueue):
                 queue.update_feedback(*tiered_stats[:4])
-                logger.debug(
-                    "Tiered CPU KV: tokens=%s/%s, completion_ns=%s/%s, "
-                    "hbm_threads=%s, residency/target/last_tier=%s",
-                    *tiered_stats,
-                    queue.tier_snapshot(),
+                self._tiered_feedback_steps = (
+                    getattr(self, "_tiered_feedback_steps", 0) + 1
                 )
+                if self._tiered_feedback_steps % 64 == 0:
+                    logger.info(
+                        "Tiered CPU KV step %d: tokens=%s/%s, "
+                        "completion_ns=%s/%s, hbm_threads=%s, "
+                        "residency/target/last_tier=%s",
+                        self._tiered_feedback_steps,
+                        *tiered_stats,
+                        queue.tier_snapshot(),
+                    )
 
         # Every GPU write enqueued by this and earlier steps has completed, so it is
         # safe to return deferred-free blocks to the pool.
