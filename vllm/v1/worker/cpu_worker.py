@@ -47,8 +47,6 @@ class CPUWorker(Worker):
         cpu_core = allowed_cpu_list[0]
         self.tiered_kv = envs.VLLM_CPU_HBM_KV_CACHE_GIB > 0
         if self.tiered_kv:
-            if envs.VLLM_CPU_TIERED_WEIGHTS_TIER not in ("hbm", "ddr"):
-                raise ValueError("VLLM_CPU_TIERED_WEIGHTS_TIER must be hbm or ddr")
             if vllm_config.cache_config.kv_cache_memory_bytes is None:
                 raise ValueError(
                     "Tiered CPU KV requires --kv-cache-memory-bytes to size "
@@ -119,16 +117,6 @@ class CPUWorker(Worker):
         )
 
         self.parallel_config.disable_custom_all_reduce = True
-
-    def load_model(self, *, load_dummy_weights: bool = False) -> None:
-        if self.tiered_kv and envs.VLLM_CPU_TIERED_WEIGHTS_TIER == "ddr":
-            torch.ops._C.init_cpu_memory_env([envs.VLLM_CPU_DDR_NODE])
-            try:
-                super().load_model(load_dummy_weights=load_dummy_weights)
-            finally:
-                torch.ops._C.init_cpu_memory_env([envs.VLLM_CPU_HBM_NODE])
-        else:
-            super().load_model(load_dummy_weights=load_dummy_weights)
 
     def init_device(self):
         self.device = torch.device("cpu")

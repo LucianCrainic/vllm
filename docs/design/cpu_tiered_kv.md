@@ -3,9 +3,8 @@
 This opt-in path targets a CPU socket with two local NUMA memory nodes: one HBM
 and one DDR. Bind the inference threads to cores on that socket. Keep both
 memory nodes available to the process. The CPU worker binds model loading to
-HBM by default, then allocates each layer's KV cache with an HBM block prefix
-and a DDR block suffix using Linux `mbind`. Weights may instead be loaded into
-DDR to reserve more HBM for KV. A block retains its tier for its lifetime;
+HBM, then allocates each layer's KV cache with an HBM block prefix and a DDR
+block suffix using Linux `mbind`. A block retains its tier for its lifetime;
 there is no page migration in the attention path.
 
 The block pool fills HBM first. Near its capacity limit, it uses smoothed
@@ -23,8 +22,6 @@ scheduler.
 - `VLLM_CPU_HBM_NODE` and `VLLM_CPU_DDR_NODE`: distinct local NUMA node IDs.
 - `VLLM_CPU_HBM_KV_CACHE_GIB`: HBM capacity reserved for KV, in GiB. It may
   cover the entire configured `--kv-cache-memory-bytes` pool.
-- `VLLM_CPU_TIERED_WEIGHTS_TIER`: `hbm` (default) or `ddr`. Only model loading
-  changes tier; subsequent non-KV allocations use HBM.
 - `VLLM_CPU_TIERED_ATTN_HBM_THREADS`: number of attention threads initially
   assigned to HBM; `0` adapts the split from measured tier completion times.
 - `VLLM_CPU_TIERED_ATTN_SCHEDULE=0`: disable tier-aware scheduling while
@@ -56,3 +53,16 @@ measurements plus actual HBM/DDR residency, the smoothed target, and the last
 allocation tier. New blocks respond to feedback; active blocks do not move.
 Fragmented prefix-cache blocks can create more tier runs and reduction work;
 measure this case separately.
+
+## Observed tradeoffs
+
+On the Llama-3.1-8B-Instruct 4096-input/1024-output benchmark, HBM-first
+tiering had no observed c48 penalty against all-HBM KV (196.4 versus 198.6 ms
+mean time per output token, three repetitions each). At c80, HBM-first tiering
+measured 304.2 ms versus 306.4 ms for the earlier fixed-fraction allocator
+(two repetitions each). This small difference is within run variation. Putting
+all KV in DDR measured 385.8 ms. Moving weights to DDR to fit the full KV pool
+in HBM measured 321.6 ms, so the delivered implementation keeps weights in HBM.
+Disabling tier-aware attention scheduling measured 303.5 ms; this result does
+not establish a gain from adapting the thread split. The scheduler switch
+remains available for continued measurement.
